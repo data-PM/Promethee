@@ -1,0 +1,508 @@
+---
+title: "Feux de forêt en Corse"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+#### *"A spessu conquista mai sottumessa"*
+
+## 1. Contexte
+
+Avec ses 402 000 ha de forêts, soit 46% de sa superficie, la Corse est l'île la plus boisée de la Méditerranée. De part le relief, la végétation et le climat de la région, le risque d'incendies est l'une des menaces environnementales les plus préocupantes.
+
+Le but de ce projet est de visualiser l'importantce de ce phénomène sur différentes carte de la Corse.
+
+## 2. Récupération des données
+
+La base *Prométhée* est la base de données officielle pour les incendies de forêts dans la zone méditerranéenne française. Elle recense plus de 110 000 feux de forêt depuis 1981, dont près de 39 000 en Corse. Elle est accessible sur [www.promethee.com](www.promethee.com).
+
+Une interface permet de sélectionner des critères de recherche, notamment de filter la région et la plage temporelle. S'affichent alors les résultats (maximum 50 par page) ainsi qu'un lien pour générer et télécharger les résultats au format CSV. Et c'est là que le bât blesse... 
+
+#### Premier problème ![](data/smiley_fear.png){width=50px}  
+Ce fichier ne donne malheureusement pas les coordonnées GPS des incendies mais seulement leur carreau DFCI. Il s'agit d'un découpage propre à la localisation des incendies en France, dans des carreaux de 2 km de côté. Pour la présente étude, cette précision pourrait suffire mais le problème est que tous les incendies d'un carreau seront localisés sur le même point : le centre du carreau.
+
+Par chance, les coordonnées GPS des incendies sont disponibles en cliquant sur les résultats (cela affiche une nouvelle page situant l'incendie sur une carte). Même mieux, ces informations se cachent dans le code source de la page web et il n'y a donc pas besoin de cliquer sur chaque feu. Un **scrapping** est donc nécessaire pour rappatrier toutes ces données.
+
+#### Second problème ![](data/smiley_problem.png){width=50px}  
+L'URL de la page pour la recherche des feux est [www.promethee.com/default/incendies](www.promethee.com/default/incendies) et... elle est fixe ! Cela veut dire qu'il est impossible de faire une boucle qui s'incrémenterait sur une URL avec un indice de page.
+
+#### Solution ![](data/smiley_idea.png){width=90px}  
+La solution à ce problème se trouve dans le package **RSelenium** qui se connecte directement à une adresse via un browser et permet de simuler les actions de navigation (remplir des champs de texte, sélectionner une valeur dans un menu déroulant, cliquer sur un bouton...).
+
+
+### 2.1 Chargement des librairies
+
+```{r library, message=FALSE}
+library(RSelenium)  # Pour simuluer la navigation
+library(rvest)      # Pour le scrapping
+library(stringr)    # Pour les expressions régulières
+library(progress)   # Pour faire une jolie barre de progression 
+```
+
+### 2.2 Fonction de scrapping
+
+C'est la fonction qui, pour une ligne (un incendie), va récupérer toutes les informations que l'on souhaite.
+```{r function, eval=FALSE}
+scrapping <- function(feux, page) {
+
+  # Récupération des coordonnées de l'incendie (latitude/longitude)
+  list_a <- html_nodes(read_html(feux), "a")
+  if (length(list_a) >= 2) {
+    att <- html_attrs(list_a[2])
+    longitude <- as.numeric(str_extract(att, "[0-9]\\.([0-9])*"))
+    latitude <- as.numeric(str_extract(att, "([0-9]){2}\\..([0-9])*"))
+  } else {
+    longitude <- 0
+    latitude <- 0
+  }
+  
+  # Récupération des caractéristiques de l'incendie (dates, lieu, surface)
+  list_span <- html_nodes(read_html(feux), "span")
+  date <- html_text(list_span[2])
+  commune <- html_text(list_span[4])
+  surface <- as.numeric(html_text(list_span[5]))
+  
+  list_div <- html_nodes(read_html(feux), "div")
+  if (length(list_a) >= 2) {
+    infos1 <- html_text(list_div[3])
+    infos2 <- html_text(list_div[5])
+  } else {
+    infos1 <- html_text(list_div[2])
+    infos2 <- html_text(list_div[4])
+  }
+  
+  alerte <- gsub("First alert : |First intervention", "", str_extract(infos1, "First alert : (.)*First intervention"))
+  deb_inter <- gsub("First intervention : |End of intervention", "", str_extract(infos1, "First intervention : (.)*End of intervention"))
+  fin_inter <- gsub("End of intervention : |Origins of the alert", "", str_extract(infos1, "End of intervention : (.)*Origins of the alert"))
+  code_INSEE <- gsub("INSEE code : |Locality", "", str_extract(infos2, "INSEE code : (.)*Locality"))
+  lieudit <- str_trim(gsub("Locality : ", "", str_extract(infos2, "Locality : (.)*")))
+  
+  # Stockage des données d'un incendie dans une table temporaire
+  liste_feux <- data.frame(commune, date, code_INSEE, longitude, latitude, lieudit, surface, alerte, deb_inter, fin_inter, page)
+  
+  return(liste_feux)
+}
+```
+
+### 2.3 Choix de critère de la recherche
+
+C'est à cette étape qu'on lance la connexion sur un navigateur...
+```{r page, message=FALSE, results='hide', eval=FALSE}
+remDr <- remoteDriver(port=4445L, browserName="chrome")
+remDr$open()
+remDr$navigate("http://www.promethee.com/default/incendies")
+```
+
+... et qu'on rentre les critères de recherche.
+```{r paramètres, eval=FALSE}
+# Date de début
+webElem <- remDr$findElement(using = 'name', 'dtAlerteDeb')
+webElem$clearElement()
+webElem$sendKeysToElement(list('01/01/1981'))
+
+# Date de fin
+webElem <- remDr$findElement(using = 'name', 'dtAlerteFin')
+webElem$clearElement()
+webElem$sendKeysToElement(list('31/12/2017'))
+
+# Zone géographique
+webElem <- remDr$findElement(using = 'name', 'codeg')
+webElem$sendKeysToElement(list('CORSE'))
+
+# Affichage maximum
+webElem <- remDr$findElement(using = 'name', 'nbrLigne')
+webElem$sendKeysToElement(list('50'))
+
+# Actualisation
+webElem <- remDr$findElement(using = 'name', 'btnSubmit')
+webElem$submitElement()
+Sys.sleep(15)
+remDr$screenshot(TRUE)
+```
+![](data/Prométhée2.png)
+
+
+### 2.4 Lancement du scrapping
+Le site *Prométhée* est particulièrement lent. Le passage à la page suivante peut prendre jusqu'à plus de 10 secondes. Le script suivant contient un temps d'attente de 15 secondes entre chaque page par sécurité. La récupération des données est donc assez long (environ 2h30). C'est pourquoi une fois le scrapping terminé, les données sont exportées dans un fichier CSV afin de ne pas avoir à le refaire chaque fois.
+```{r scrapping, eval=FALSE}
+# Récupération du nombre total de pages pour fermer la boucle 
+text_base <- read_html(remDr$getPageSource()[[1]])
+list_tr <- html_nodes(text_base, "tr")
+a <- html_nodes(list_tr[length(list_tr)], "a")
+page_max <- as.numeric(html_text(a[10]))
+page_max
+
+df <- data.frame()
+
+#for (page in 1:page_max) {
+for (page in 1:3) {
+    
+  # Initialisation du srcapping
+  text_base <- read_html(remDr$getPageSource()[[1]])
+  list_tr <- html_nodes(text_base, "tr")
+  
+  # Paramètre pour commencer au bon bloc <tr>
+  if (length(html_nodes(read_html(as.character(list_tr[14])), "a")) == 8) {
+    deb = 15
+  } else {
+    deb = 14
+  }
+  
+  # Récupération de toutes les données de la page en appliquant la fonction de scrapping sur chaque ligne
+  for (i in deb:(deb+49)) {
+    feux <- as.character(list_tr[i])
+    df <- rbind(df, scrapping(feux, page))
+  }
+  
+  # Passage à la page suivante (la code html n'est pas le même sur la première page)
+  if (page == 1) {
+    webElem <- remDr$findElement(using = 'xpath', '//*[contains(concat( " ", @class, " " ), concat( " ", "page_img", " " ))]')
+  } else {
+    webElem <- remDr$findElement(using = 'xpath', '//*[contains(concat( " ", @class, " " ), concat( " ", "page_img", " " ))][3]')
+  }
+  webElem$clickElement()
+  
+  # Pour suivre le déroulement du scrapping
+  # Le temps de réponse du site étant assez long, un temps d'attente de 15 sec est nécessaire
+  heure = (floor((page_max-page)*15/60) - floor((page_max-page)*15/60) %% 60) / 60
+  minute = floor((page_max-page)*15/60) %% 60
+  pb <- progress_bar$new(total = 100)
+  for (i in 1:100) {
+    if (i==1) {cat("page", page, "sur", page_max," -  (reste", heure, "h", minute, "min)",  "\n")}
+    pb$tick()
+    Sys.sleep(15 / 100)
+  }
+  remDr$screenshot(TRUE)
+}
+
+# Création d'un fichier CSV pour sécuriser le scrapping
+write.csv(df, 'promethee_r.csv')
+```
+
+### 2.5 Mise en forme des données
+Les données sont alors retraitées (renommage des variables, creéations de nouvelles variables, formats...).
+
+*NB : le scrapping étant long et parfois instable, un fichier CSV a été préalablement créé pour ne pas refaire le scrapping à chaque fois*
+```{r data, eval=TRUE}
+library(data.table)
+
+# Import des données d'incendies
+feux <- fread("./data/promethee.csv", dec=".")
+
+# Retraitement des variables
+colnames(feux)[colnames(feux)=="longitude"] <- "x"
+colnames(feux)[colnames(feux)=="latitude"] <- "y"
+
+feux[, date := as.Date(date, "%d/%m/%Y")]
+
+feux[, date_alerte := as.Date(substr(alerte, 1, 10), "%d/%m/%Y")]
+feux$heure_alerte[nchar(feux$alerte) > 10] <- substr(feux$alerte[nchar(feux$alerte) > 10], 12, 16)
+feux$heure_alerte[!(nchar(feux$alerte) > 10)] <- ""
+
+feux[, date_deb_inter := substr(deb_inter, 1, 10)]
+feux[, date_deb_inter := as.Date(date_deb_inter, "%d/%m/%Y")]
+feux$heure_deb_inter[nchar(feux$deb_inter) > 10] <- substr(feux$deb_inter[nchar(feux$deb_inter) > 10], 12, 16)
+feux$heure_deb_inter[!(nchar(feux$deb_inter) > 10)] <- ""
+feux$heure_deb_inter[feux$heure_deb_inter == "00:00"] <- ""
+
+feux[, date_fin_inter := substr(fin_inter, 1, 10)]
+feux[, date_fin_inter := as.Date(date_fin_inter, "%d/%m/%Y")]
+feux$heure_fin_inter[nchar(feux$fin_inter) > 10] <- substr(feux$fin_inter[nchar(feux$fin_inter) > 10], 12, 16)
+feux$heure_fin_inter[!(nchar(feux$fin_inter) > 10)] <- ""
+feux$heure_fin_inter[feux$heure_fin_inter == "00:00"] <- ""
+```
+
+## 3. Analyse des données
+
+
+
+
+
+
+```{r stat_desc1, eval=TRUE, fig.width=10, fig.height=4, fig.align="center"}
+library(ggplot2, verbose=FALSE, quietly=TRUE, warn.conflicts=FALSE)
+
+#feux_temp <- feux
+
+feux$annee <- year(feux$date_alerte)
+feux$month <- month(feux$date_alerte)
+
+agg_annee <-aggregate(alerte~annee, FUN=length, data=feux)
+colnames(agg_annee)[colnames(agg_annee)=="alerte"] <- "Nombre"
+
+theme_set(theme_classic())
+
+# Histogramme de la du nombre de feux de fôrets par an
+nb <- ggplot(agg_annee) +
+  geom_bar(aes(x=annee, y=Nombre, fill="Feux de forêts"), stat="identity", width = 0.8) +
+  scale_colour_manual(name=NULL, values=c("orange")) +
+  ggtitle("Nombre de feux par an") +
+  theme(plot.title = element_text(hjust = 0.5, size=14),
+        legend.position = "none",
+        axis.text.x = element_text(angle=50, vjust=0.5, size=10),
+        axis.text.y = element_text(size=12),
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank()) +
+  scale_fill_discrete("") +
+  scale_x_discrete(limit=seq(1981, 2017, by = 2))
+
+agg_surface <-aggregate(surface~annee, FUN=sum, data=feux)
+
+# Histogramme de la surface de feux de fôrets par an
+surf <- ggplot(agg_surface) +
+  geom_bar(aes(x=annee, y=surface, fill="Feux de forêts"), stat="identity", width = 0.8) +
+  scale_colour_manual(name=NULL, values=c("orange")) +
+  ggtitle("Surface totale incendiée par an (en ha)") +
+  theme(plot.title = element_text(hjust = 0.5, size=14),
+        legend.position = "none",
+        axis.text.x = element_text(angle=50, vjust=0.5, size=10),
+        axis.text.y = element_text(size=12),
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank()) +
+  scale_fill_discrete("") +
+  scale_x_discrete(limit=seq(1981, 2017, by = 2)) +
+  scale_y_discrete(limit=seq(0, 25000, by = 5000))
+
+# Affichage des graphiques sur une grille
+require(grid)
+grid.newpage()
+pushViewport(viewport(layout = grid.layout(1, 2)))
+define_region <- function(row, col){
+  viewport(layout.pos.row = row, layout.pos.col = col)
+} 
+
+print(nb, vp = define_region(1, 1))
+print(surf, vp = define_region(1, 2))
+```
+
+
+```{r stat_desc2, eval=TRUE, fig.width=6, fig.height=8, fig.align="center"}
+agg_mois <-aggregate(alerte~month, FUN=length, data=feux)
+mois <- c("Janvier", "Février", "Mars", "Avril",
+          "Mai", "Juin", "Juillet", "Août",
+          "Septembre", "Octobre", "Novembre", "Décembre")
+agg_mois$mois <- mois
+colnames(agg_mois)[colnames(agg_mois)=="alerte"] <- "Nombre"
+agg_mois$nb_feux <- agg_mois$Nombre/sum(agg_mois$Nombre)
+
+# Températures mensuelles maximales en 2016
+temperature <- data.frame("Ajaccio" = c(9.2,10.5,14.9,17.3,20.3,23.7,25.4,25.7,23.1,18.1,12.7,9.3),
+                          "Bastia" = c(13.5,14.7,16.6,19,22.6,22.6,29.5,29.9,27.1,22.6,18.1,15.2))
+temperature$temperature <- (temperature$Ajaccio + temperature$Bastia)/2
+agg_mois <- cbind(agg_mois, temperature)
+agg_mois$temperature <- agg_mois$temperature/sum(agg_mois$temperature)
+
+# Nombres de passages aériens et maritimes en 2016
+agg_mois$passagers = c(208432, 198511, 217008, 478951, 646060, 821449, 1467702, 1717166, 920051, 538141, 218701, 247488)
+agg_mois$passagers <- agg_mois$passagers/sum(agg_mois$passagers)
+
+theme_set(theme_classic())
+
+# Histogramme de la répartition mensuelle des feux de fôrets
+# Courbes des passagers et de la température
+g <- ggplot(agg_mois) +
+  geom_bar(aes(x=month, y=nb_feux, fill="Feux de forêts"), stat="identity", width = 0.8) +
+  geom_smooth(aes(x=month, y=temperature, col="Température"), se=FALSE) +
+  geom_smooth(aes(x=month, y=passagers, col="Flux de passagers"), se=FALSE) +
+  scale_colour_manual(name=NULL, values=c("light blue", "red", "orange")) +
+  ggtitle("Répartition mensuelle des feux\n") +
+  theme(plot.title = element_text(hjust = 0.5, size=16),
+        legend.position = c(0.25, 0.7),
+        legend.text=element_text(size=12),
+        axis.text.x = element_text(angle=50, vjust=0.5, size=12),
+        axis.text.y = element_text(size=12),
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank()) +
+  scale_fill_discrete("") +
+  scale_x_discrete(limit=c(1:12), labels=mois) +
+  scale_y_continuous(labels=scales::percent, breaks=seq(0, 0.3, 0.05))
+
+# Fonction du coefficient de corrélation
+corr_eqn <- function(x,y, digits = 2) {
+  corr_coef <- round(cor(x, y), digits = digits)
+  paste("r =", corr_coef)
+}
+labels1 = data.frame(x = -3.1, y = 0.115, label = corr_eqn(log(agg_mois$nb_feux), agg_mois$temp))
+labels2 = data.frame(x = 0.1, y = 0.2, label = corr_eqn(agg_mois$nb_feux, agg_mois$temp))
+
+# Nuages de points des corrélations
+a <- ggplot(agg_mois) + 
+  geom_point(aes(x=log(nb_feux), y=temperature), color="red") +
+  geom_smooth(aes(x=log(nb_feux), y=temperature), method=lm, se=FALSE, linetype="dashed", color="darkred") +
+  geom_label(data = labels1, aes(x = x, y = y, label = label), fontface = c("bold")) +
+  guides(fill=FALSE)
+b <- ggplot(agg_mois) + 
+  geom_point(aes(x=nb_feux, y=passagers), color="light blue") +
+  geom_smooth(aes(x=nb_feux, y=passagers), method=lm, se=FALSE, linetype="dashed", color="blue") +
+  geom_label(data = labels2, aes(x = x, y = y, label = label), fontface = c("bold")) +
+  guides(fill=FALSE)
+
+
+grid.newpage()
+pushViewport(viewport(layout = grid.layout(3, 2)))
+
+print(g, vp = define_region(1:2, 1:2))
+print(a, vp = define_region(3, 1))
+print(b, vp = define_region(3, 2))
+
+```
+
+
+
+
+
+
+```{r shapefile_lib, eval=TRUE, warning=FALSE, message=FALSE}
+library(raster, verbose=FALSE, quietly=TRUE, warn.conflicts=FALSE)
+library(plotly, verbose=FALSE, quietly=TRUE, warn.conflicts=FALSE)
+library(raster, verbose=FALSE, quietly=TRUE, warn.conflicts=FALSE)
+library(viridis, verbose=FALSE, quietly=TRUE, warn.conflicts=FALSE)
+```
+
+
+```{r tables2, eval=TRUE}
+# Feux de 100 ha minimum
+feux_min100ha <- feux[feux$surface > 100, ]
+feux_min100ha[, mytext := paste(commune, "\n", date, "\n", surface, " Ha", sep="")]
+feux_min100ha[, mytext := as.factor(mytext)]
+
+# Feux de 1000 m2 minimum
+feux_min1000m2 <- feux[feux$surface > 0.1, ]
+```
+
+```{r shapefile_corse, eval=FALSE, warning=FALSE, message=FALSE}
+# Import de la Corse (shapefile)
+france <- shapefile("./data/departements-20180101-shp/departements-20180101.shp")
+corse <- france[france$nom %in% c("Corse-du-Sud","Haute-Corse"), ] #Shapefile
+corse <- spTransform(corse, CRS("+proj=longlat +datum=WGS84"))
+corse <- fortify(corse)
+```
+
+```{r plotly, eval=FALSE, warning=FALSE, message=FALSE, fig.align="center"}
+# Visualisation graphique (ggplot2)
+p=data %>%
+  ggplot() +
+  geom_polygon(data=corse, aes(x=long, y = lat, group = group), fill="grey", alpha=0.3) +
+  geom_point(data=feux_min100ha, aes(x=x, y=y, size=surface, color=surface, text=mytext, alpha=surface) ) +
+  labs(title = "\nPrincipaux feux de forêts depuis 1981 \n (plus de 100 Ha)") +
+  xlim(8.5, 9.6) + ylim(41.3,43.1) +
+  scale_size_continuous(range=c(1,5), ) +
+  scale_color_viridis(option="inferno", trans="log", name="Surface", limits=c(99, 5700), breaks=c(100, 200, 500, 1000, 2500, 5000)) +
+  scale_alpha_continuous(trans="log") +
+  theme_void() +
+  theme(legend.title = element_text(size=10, face="bold"))
+
+# Visualisation Bubble (plotly)
+# La library shiny ne sert ici qu'à centrer le plotly dans le markdown (seule solution connue)
+t=800
+library(shiny)
+div(ggplotly(tooltip="text", width=t/1.7, height=t), align = "center")
+#ggplotly(tooltip="text", width=t/1.7, height=t)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+```{r choroplethe_lib, eval=FALSE, warning=FALSE, message=FALSE}
+library(sp)
+library(cartography)
+library(rgeos)
+library(raster)
+```
+
+```{r shapefile_communes, eval=FALSE, fig.align="center"}
+# Import des communes de Corse (shapefile)
+communes <- shapefile("./data/communes-20180101-shp/communes-20180101.shp")
+communes_corse <- communes[substr(communes$insee, 1, 2) %in% c("2A", "2B"), ]
+communes_corse <- spTransform(communes_corse, CRS("+proj=longlat +datum=WGS84"))
+
+# 
+feux_INSEE <- aggregate(x = feux_min1000m2$code_INSEE, by = list(unique.values = feux_min1000m2$code_INSEE), FUN = length)
+colnames(feux_INSEE)[colnames(feux_INSEE)=="unique.values"] <- "insee"
+communes_corse <- merge(x = communes_corse, y = feux_INSEE, by = "insee", all.x = TRUE)
+communes_corse$x[is.na(communes_corse$x)] <- 0
+max <- max(communes_corse$x)
+communes_corse$x2 <- communes_corse$x/max * 100
+
+corse2 <- gSimplify(communes_corse, tol = 0.001, topologyPreserve = TRUE)
+corse2 <- SpatialPolygonsDataFrame(corse2, communes_corse@data, match.ID = FALSE)
+
+
+
+opar <- par(mar = c(0,0,1.2,0))
+plot(corse2, col = "#DAE3E6", border = "#8A0641", lwd = 0.7, bg = "#B5D0D0")
+
+# Carte choroplethe
+choroLayer(spdf = corse2, df = corse2@data, var = "x", border = NA, 
+           col = carto.pal("wine.pal", 6), legend.pos = "topleft", 
+           add = TRUE, method = "fisher-jenks", nclass = 6, legend.title.txt = NULL)
+
+# ajout des des villes
+top_villes <- corse2[corse2$nom %in% c("Ajaccio", "Bastia", "Corte", "Porto-Vecchio", "Propriano", "Bonifacio", "Calvi"), ]
+graphics::points(coordinates(top_villes), pch = 20, cex = 0.5)
+labelLayer(top_villes, top_villes@data, txt = "nom", cex = 1, pos = 2, font = 4, offset = 0.5)
+
+# Habillage
+layoutLayer(title = "Nombre de feux de forêts depuis 1981 (minimum 1000 m2)",
+            source = "Source : 1973-2018 Prométhée ©",
+            author = NULL, scale = 10, frame = FALSE, col = "#cdd2d4", coltitle = "#8A5543")
+```
+
+
+
+
+```{r shiny, eval=FALSE, warning=FALSE, message=FALSE, fig.width=9.5, fig.height=6}
+# Chargement des librairies
+#library(shiny)
+library(leaflet)
+
+# Création de tables des feux de 100 ha par décennie
+feux1 <- feux_min100ha[feux_min100ha$annee %in% c(1981:1989), ]
+feux2 <- feux_min100ha[feux_min100ha$annee %in% c(1990:1999), ]
+feux3 <- feux_min100ha[feux_min100ha$annee %in% c(2000:2009), ]
+feux4 <- feux_min100ha[feux_min100ha$annee %in% c(2010:2017), ]
+
+# Initialisation de la Corse
+leaflet() %>% 
+  setView(lng=9, lat=42.2, zoom=8 ) %>%
+  addTiles(options = providerTileOptions(noWrap = TRUE), group="Classique") %>%
+  addProviderTiles("Esri.WorldImagery", group="Satellite") %>%
+  
+  # Ajout des feux par décennie
+  addCircleMarkers(data=feux1, lng=~feux1$x, lat=~feux1$y,
+                   radius=5 , color="black",
+                   fillColor=heat.colors(4)[1],
+                   stroke = F, fillOpacity = 0.8, group="1981 - 1989") %>%
+
+  addCircleMarkers(data=feux2, lng=~feux2$x, lat=~feux2$y,
+                   radius=5 , color="black",
+                   fillColor=heat.colors(4)[2],
+                   stroke = F, fillOpacity = 0.8, group="1990 - 1999") %>%
+  
+  addCircleMarkers(data=feux3, lng=~feux3$x, lat=~feux3$y,
+                   radius=5 , color="black",
+                   fillColor=heat.colors(4)[3],
+                   stroke = F, fillOpacity = 0.8, group="2000 - 2009") %>%
+  
+  addCircleMarkers(data=feux4, lng=~feux4$x, lat=~feux4$y,
+                   radius=5 , color="black",
+                   fillColor=heat.colors(4)[4],
+                   stroke = F, fillOpacity = 0.8, group="2010 - 2017") %>%
+
+  # Fenêtre de paramétrage
+  addLayersControl(overlayGroups = c("1981 - 1989", "1990 - 1999", "2000 - 2009", "2010 - 2017") , baseGroups = c("Satellite", "Classique"),
+                   options = layersControlOptions(collapsed = FALSE))
+
+```
+
